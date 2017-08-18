@@ -26,7 +26,7 @@ import collectd
 ################################################################################
 # CONFIGURE ME
 ################################################################################
-INTERVAL = 300
+INTERVAL = 20
 
 ################################################################################
 # DO NOT CHANGE BEYOND THIS POINT!
@@ -64,7 +64,7 @@ def configure_callback(conf):
     password = None
     host_counters = []
     vm_counters = []
-    inventory_refresh_interval = 600
+    inventory_refresh_interval = 60
 
     for node in conf.children:
         key = node.key.lower()
@@ -157,25 +157,51 @@ def read_callback():
         env = ENVIRONMENT[name]
         collectd.info("read_callback: entering environment: " + name)
 
-        # Connects to vCenter Server
-        service_instance = SmartConnect(
-            host=env["host"], user=env["username"], pwd=env["password"]
-        )
+	service_instance = SmartConnect(
+		host=env["host"], user=env["username"], pwd=env["password"]
+	)
+
         performance_manager = service_instance \
-            .RetrieveServiceContent() \
-            .perfManager
+          	.RetrieveServiceContent() \
+            	.perfManager
 
         # Walk through all Clusters of Datacenter
         for datacenter in service_instance \
                 .RetrieveServiceContent() \
                 .rootFolder.childEntity:
             if datacenter._wsdlName == "Datacenter":
+		collectd.info("WalkThrough: DC: " + datacenter.name)
                 for compute_resource in datacenter.hostFolder.childEntity:
-                    if compute_resource._wsdlName == \
+                    if compute_resource._wsdlName == "Folder":
+			for folder in compute_resource.childEntity:
+				if folder._wsdlName == \
+                            		"ComputeResource" \
+                            		or folder._wsdlName == \
+                                    		"ClusterComputeResource":
+					cluster_name = \
+                            		folder.name if env['use_friendly_name'] \
+                                		else folder._moId
+                        
+                        		collectd.info(
+                            			"read_callback: found %d hosts in cluster %s" % (
+                               				len(folder.host),
+                                			folder.name
+                            			)
+                        		)
+                        		collet_metrics_for_entities(
+                            			service_instance,
+                            			performance_manager,
+                            			env['host_counter_ids'],
+                            			folder.host,
+                            			cluster_name,
+                            			env
+                        		)
+
+		    if compute_resource._wsdlName == \
                             "ComputeResource" \
                             or compute_resource._wsdlName == \
                                     "ClusterComputeResource":
-                        cluster_name = \
+			cluster_name = \
                             compute_resource.name if env['use_friendly_name'] \
                                 else compute_resource._moId
                         # Walk throug all hosts in cluster, collect its metrics
@@ -211,6 +237,13 @@ def read_callback():
                                     host.vm,
                                     cluster_name,
                                     env
+                                )
+                        for datastore in compute_resource.datastore:
+                            if host._wsdlName == "HostSystem":
+                                collectd.info(
+                                    "read_callback: found %d datastores on host %s - datastore %s" % (
+                                        len(host.datastore), host.name, datastore.name
+                                    )
                                 )
         Disconnect(service_instance)
 
@@ -258,7 +291,7 @@ def collet_metrics_for_entities(service_instance, performance_manager,
     collectd.info("GetMetricsForEntities: collecting its stats")
     perf_entity_metrics = performance_manager.QueryPerf(query_specs)
 
-    cd_value = collectd.Values(plugin="collectsphere")
+    cd_value = collectd.Values(plugin="Vcenter")
     # Walk throug all entites of query
 
     # for perf_entity_metric in perf_entity_metrics:
@@ -316,28 +349,31 @@ def collet_metrics_for_entities(service_instance, performance_manager,
                 # This is the overall value accross all logical CPUs.
                 # if(len(stat.instance.strip()) == 0):
                 #   instance = 'all'
-                instance = "all" if instance == "" else instance
-                type_instance_str = \
-                    cluster_name + "." + re.sub(
-                        pattern=r'[^A-Za-z0-9_]',
-                        repl='_',
-                        string=
-                        (
+ 		host_name = re.sub(
+                    pattern=r'[^A-Za-z0-9_]',
+                    repl='_',
+                    string=
+                    (
                             entity.name
                             if env['use_friendly_name']
                             else
                             entity._moId
-                        )
-                    ) + "." + instance
+                    )
+                )
+                if "_" in host_name:
+	                host_name = host_name.split("_")[0]
+                instance = "all" if instance == "" else instance
+                type_instance_str = \
+ 		cluster_name + "." + host_name + "." + group + "_" + counter +  "." + instance
                 dispatched_value = \
-                    str(timestamp) + type_instance_str + str(perf_metric)
+                    str(timestamp) + cluster_name + type_instance_str + str(perf_metric)
                 if (dispatched_value) in dispatched_values:
                     continue
                 else:
                     dispatched_values.append(dispatched_value)
                     # now dispatch to collectd
                     collectd.info("dispatch " + str(
-                        timestamp) + "\t" + type_instance_str + "\t" + str(
+                        timestamp) + "\t" + cluster_name + "\t" + host_name + "\t" + type_instance_str + "\t" + str(
                         long(perf_metric)))
                     cd_value.type = re.sub(
                         pattern=r'[^A-Za-z0-9_]',
@@ -351,6 +387,7 @@ def collet_metrics_for_entities(service_instance, performance_manager,
                                     + "." + unit
                     try:
                         cd_value.dispatch(time=timestamp,
+					  host=host_name,
                                           type_instance=type_instance_str,
                                           values=[long(perf_metric)])
                     except Exception:
@@ -428,6 +465,7 @@ def create_environment(config):
 
     host = None
     virtual_machine = None
+
     for child in service_instance \
             .RetrieveServiceContent() \
             .rootFolder.childEntity:
@@ -470,6 +508,7 @@ def create_environment(config):
     # Get all queryable aggregated and realtime metrics for an entity
     env['lookup_host'] = []
     env['lookup_vm'] = []
+    env['lookup_datastore'] = []
     if len(performance_manager.historicalInterval) is not 0:
         performance_interval = performance_manager.historicalInterval[0]
         samplingPeriod = performance_interval.samplingPeriod
@@ -494,6 +533,7 @@ def create_environment(config):
         None,
         samplingPeriod
     )
+
     # Query aggregated realtime mertics for host and virtual_machine
     env['lookup_host'] += performance_manager.QueryAvailablePerfMetric(
         host,
